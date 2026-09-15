@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+import userdl
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -287,11 +288,16 @@ def user_usage(user_id: int) -> int:
     return sum(f["size"] for f in FILES if f["user_id"] == user_id)
 
 
-async def safe_edit(msg: Optional[Message], text: str, markup: Optional[InlineKeyboardMarkup] = None) -> None:
+async def safe_edit(
+    msg: Optional[Message],
+    text: str,
+    markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = ParseMode.MARKDOWN,
+) -> None:
     if msg is None:
         return
     try:
-        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        await msg.edit_text(text, parse_mode=parse_mode, reply_markup=markup)
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             log.debug("编辑消息失败: %s", exc)
@@ -539,6 +545,115 @@ def guess_name(url: str, resp: httpx.Response) -> str:
     return name or "download.bin"
 
 
+TME_SETUP_TEXT = (
+    "ℹ️ 解析 *t.me/频道/123* 这种链接需要一个登录过的用户账号（Bot API 做不到）。\n\n"
+    "*一次性配置：*\n"
+    "1️⃣ 到 my.telegram.org 申请 *API ID* 和 *API Hash*（免费）\n"
+    "2️⃣ 填到 .env 的 `API_ID` / `API_HASH`\n"
+    "3️⃣ 在项目目录双击 `login_tg.bat`，按提示登录你的 Telegram 账号（只需一次）\n\n"
+    "配置好之前，也可以把频道消息 *长按转发* 给我，一样能下载。"
+)
+
+
+async def download_tme(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    tag: str,
+) -> None:
+    """解析 t.me/频道/123 消息链接并下载其中的媒体（Telethon 用户账号）。"""
+    msg = update.effective_message
+    user = update.effective_user
+
+    if not userdl.available():
+        await msg.reply_text(TME_SETUP_TEXT, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    status = await msg.reply_text("🔗 正在解析 Telegram 消息链接…")
+    try:
+        msgs = await userdl.fetch_messages(url)
+    except userdl.NotLoggedIn:
+        await safe_edit(
+            status,
+            "⚠️ 用户账号还没登录。\n"
+            "在服务器上双击 `login_tg.bat`，按提示登录一次（之后一直有效）。",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("解析 t.me 链接失败: %s", exc)
+        await safe_edit(status, f"❌ {exc}")
+        return
+
+    total = sum(userdl.media_size(m) for m in msgs)
+    if USER_QUOTA_MB:
+        used = user_usage(user.id)
+        if used + total > USER_QUOTA_MB * 1024 * 1024:
+            await safe_edit(
+                status,
+                f"⚠️ 你的磁盘配额已用完（{human_size(used)} / {USER_QUOTA_MB} MB），"
+                "请先用 /del 删除一些文件。",
+            )
+            return
+
+    # 标签：用户消息/回复的文字优先，其次用频道消息自带的 caption
+    if not tag:
+        tag = clean_label(msgs[0].caption or "")
+
+    ok, failed, done_bytes = 0, 0, 0
+    album = len(msgs) > 1
+    for idx, tmsg in enumerate(msgs, 1):
+        filename = label_to_name(tag, userdl.media_name(tmsg), idx if album else None)
+        dest = unique_path(DOWNLOAD_DIR / str(user.id), filename)
+        await safe_edit(
+            status,
+            f"⬇️ `{dest.name}`\n{progress_bar(0, total)}"
+            + (f"\n第 {idx}/{len(msgs)} 个" if album else ""),
+        )
+        last_push = {"t": 0.0}
+
+        # telethon 的进度回调是同步的，节流后丢回事件循环刷新进度条
+        def on_prog(cur: int, tot: int, _s=status, _n=dest.name, _idx=idx, _album=album):
+            now = time.monotonic()
+            if now - last_push["t"] >= PROGRESS_INTERVAL:
+                last_push["t"] = now
+                suffix = f"\n第 {_idx}/{len(msgs)} 个" if _album else ""
+                asyncio.get_running_loop().create_task(
+                    safe_edit(_s, f"⬇️ `{_n}`\n{progress_bar(cur, tot or 0)}{suffix}")
+                )
+
+        try:
+            written = await userdl.download(tmsg, dest, on_prog)
+            ok += 1
+            done_bytes += written
+            entry = {
+                "id": new_file_id(),
+                "name": dest.name,
+                "label": tag,
+                "size": written,
+                "user_id": user.id,
+                "username": user.username or user.full_name,
+                "chat_id": msg.chat_id,
+                "tg_file_id": None,
+                "path": str(dest.relative_to(DOWNLOAD_DIR)),
+                "source": "tme",
+                "url": url,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            await record(entry)
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            log.warning("t.me 文件下载失败: %s", exc)
+            dest.unlink(missing_ok=True)
+
+    head = f"✅ {'相册' if album else '文件'}下载完成：{ok}/{len(msgs)} 个，共 {human_size(done_bytes)}"
+    if failed:
+        head += f"\n⚠️ {failed} 个失败"
+    if tag:
+        head += f"\n🏷 标签：{tag}"
+    await safe_edit(status, head)
+
+
 async def download_url(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str = "") -> None:
     msg = update.effective_message
     user = update.effective_user
@@ -546,13 +661,7 @@ async def download_url(update: Update, context: ContextTypes.DEFAULT_TYPE, label
     tag = clean_label(label) or clean_label(replied_text(msg))
 
     if TME_RE.match(url):
-        await msg.reply_text(
-            "ℹ️ 这是 *Telegram 频道/群组消息链接*，不是文件直链，机器人没法直接抓取。\n\n"
-            "✅ 正确姿势：打开那条消息 → *长按转发* 给我，我就能下载里面的文件。\n"
-            "⚠️ 注意：如果频道开了「限制保存内容」，转发也拿不到文件。\n\n"
-            "_（想直接解析 t.me 链接需要用户账号 API，需要的话跟我说）_",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await download_tme(update, context, url, tag)
         return
 
     status = await msg.reply_text(f"🔗 正在拉取直链…\n`{url}`", parse_mode=ParseMode.MARKDOWN)

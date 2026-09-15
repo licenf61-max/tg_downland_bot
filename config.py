@@ -123,5 +123,10 @@ USER_QUOTA_MB: int = int(_env("USER_QUOTA_MB", "0"))
 # 日志级别
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO").upper()
 
+# Telethon 用户账号（解析 t.me/频道/123 消息链接用）。
+# 到 https://my.telegram.org 免费申请，填 API ID 和 API Hash。留空 = 不启用该功能
+API_ID: int = int(_env("API_ID") or "0")
+API_HASH: str = _env("API_HASH")
+
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
