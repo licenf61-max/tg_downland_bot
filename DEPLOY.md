@@ -28,6 +28,12 @@
    显示 `Python 3.x.x` 就成功了
 
 > 忘了勾 Add to PATH？卸载重装一次，勾上就行。
+>
+> ⚠️ **Windows 自带的「Python 占位程序」陷阱**：很多电脑（尤其是从来没装过 Python 的）
+> 在 `C:\Users\你\AppData\Local\Microsoft\WindowsApps\` 下已经有一个
+> **0 字节的 `python.exe`**。它不是真的 Python，输入 `python` 会弹出微软应用商店。
+> 这种电脑上 `python --version` 会提示「Python 未找到」，请老老实实去 python.org 装一个。
+> （`run.bat` 已会自动跳过这个占位程序，不会误用。）
 
 ## 第 2 步：拿到代码（不用装 Git）
 
@@ -47,7 +53,16 @@
 
 看到它停在窗口里不报错，就说明装好了。**先按 `Ctrl + C`（或直接关窗口）停掉**，去做第 4 步。
 
-> 如果报 `Python not found` → 第 1 步的 PATH 没勾；如果 pip 卡住 → 检查这台电脑能不能上网。
+> **run.bat 报错对照表**
+>
+> | 窗口里看到 | 原因 | 怎么办 |
+> | --- | --- | --- |
+> | `[ERROR] No usable Python 3 found` | 没有真 Python，或只装了商店占位程序 | 回第 1 步，去 python.org 装，勾 Add to PATH |
+> | `[ERROR] Could not create .venv` | Python 找到了但装依赖失败 | 关掉杀毒软件重试，或手动在目录里执行 `python -m venv .venv` |
+> | `[ERROR] pip install failed` | 网络/代理拦住了 pip | 检查能不能上网；关掉代理软件再试一次 |
+> | 窗口一闪就没 | 没有走到 `pause` | 在项目目录地址栏输入 `cmd` 回车，手动敲 `run.bat`，这样报错不会消失 |
+>
+> `run.bat` 找不到 `.env` 时会自动从 `.env.example` 复制一份，并打开记事本让你填 Token。
 
 ## 第 4 步：配置 .env
 
