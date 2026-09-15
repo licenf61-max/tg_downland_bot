@@ -144,6 +144,44 @@ def sanitize(name: str, fallback: str = "file") -> str:
     return name[:120] or fallback
 
 
+# 文件名用发送者给的文字标签，方便索引。标签上限（不含扩展名）
+LABEL_MAX = 80
+_LABEL_TRIM = " \t\r\n:：-—–_,，。、;；|·"
+
+
+def clean_label(text: Optional[str]) -> str:
+    """把发送者提供的文字整理成标签：去掉换行、压掉多余空白和首尾分隔符。"""
+    if not text:
+        return ""
+    return " ".join(text.split()).strip(_LABEL_TRIM)
+
+
+def label_to_name(label: Optional[str], original: str, index: Optional[int] = None) -> str:
+    """用文字标签当文件名，保留原始扩展名；标签为空则退回原文件名。
+
+    标签本身已带同名扩展名时不重复追加（避免「报告.pdf.pdf」）。
+    index 用于相册：多个文件共用一个标签时编号成「标签_1」「标签_2」。
+
+    注意：这里不能用 sanitize()，因为它会先取 basename，
+    把标签里「/」之前的内容整个丢掉（「2024/09 报告」会变成「09 报告」）。
+    """
+    label = clean_label(label)
+    if not label:
+        return original
+    ext = Path(original).suffix
+    if index is not None:
+        label = f"{label}_{index}"
+    label = label[:LABEL_MAX]
+    # 逐个替换非法字符（不是截断），再去掉首尾的点和空格
+    label = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", label).strip(". ")
+    label = " ".join(label.split())
+    if not label:
+        return original
+    if ext and label.lower().endswith(ext.lower()):
+        return label[:120]
+    return f"{label}{ext}"[:120]
+
+
 def unique_path(folder: Path, filename: str) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / filename
@@ -335,8 +373,30 @@ def extract_media(msg: Message) -> tuple[Any, str]:
     raise ValueError("这条消息里没有可下载的文件")
 
 
-async def save_one(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> tuple[dict[str, Any], str]:
-    """下载一条消息里的文件，返回 (索引记录, 结果文案)。"""
+def replied_text(msg: Message) -> str:
+    """若这条消息是「回复某条带文字的消息」发的，借那条文字当标签。
+
+    支持两种习惯：先写标签再回复它发文件，或回复某个文件补一句说明。
+    """
+    replied = getattr(msg, "reply_to_message", None)
+    if replied is None:
+        return ""
+    if replied.text:
+        return replied.text
+    return replied.caption or ""
+
+
+async def save_one(
+    msg: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    label: Optional[str] = None,
+    index: Optional[int] = None,
+) -> tuple[dict[str, Any], str]:
+    """下载一条消息里的文件，返回 (索引记录, 结果文案)。
+
+    文件名优先用发送者给的文字标签，取用顺序：
+    显式传入的 label（相册共用标签）→ 消息自带的 caption → 回复的那条文字 → 原始文件名。
+    """
     user = msg.from_user
     file_obj, filename = extract_media(msg)
     size = getattr(file_obj, "file_size", 0) or 0
@@ -349,11 +409,10 @@ async def save_one(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> tuple[di
                 f"请先用 /del 删除一些文件。"
             )
 
+    if label is None:
+        label = msg.caption or replied_text(msg)
     folder = DOWNLOAD_DIR / str(user.id)
-    if msg.caption and msg.caption.strip():
-        # 有文字说明就用它当文件名，保留原扩展名
-        ext = Path(filename).suffix
-        filename = sanitize(f"{msg.caption.strip()[:80]}{ext}")
+    filename = label_to_name(label, filename, index)
     dest = unique_path(folder, filename)
 
     try:
@@ -379,6 +438,7 @@ async def save_one(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> tuple[di
     entry = {
         "id": new_file_id(),
         "name": dest.name,
+        "label": clean_label(label),
         "size": size,
         "user_id": user.id,
         "username": user.username or user.full_name,
@@ -439,18 +499,29 @@ async def _flush_album(context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
     if not bucket or not bucket["messages"]:
         return
     messages: list[Message] = bucket["messages"]
+    messages.sort(key=lambda m: m.message_id)
+    # 相册的文字说明往往只挂在其中一条消息上，抽出来给整组共用
+    group_label = next((t for t in (clean_label(m.caption) for m in messages) if t), "")
+    numbering = len(messages) > 1
+
     status = await messages[0].reply_text(f"⏳ 收到 {len(messages)} 个文件，开始下载…")
     ok, total_bytes, failed = 0, 0, 0
     for idx, msg in enumerate(messages, 1):
         await safe_edit(status, f"⏳ 正在下载第 {idx}/{len(messages)} 个…\n{progress_bar(0, 0)}")
+        label = clean_label(msg.caption) or group_label
         try:
-            entry, _ = await save_one(msg, context)
+            entry, _ = await save_one(
+                msg, context, label=label, index=idx if (numbering and label) else None
+            )
             ok += 1
             total_bytes += entry["size"]
         except Exception as exc:  # noqa: BLE001
             failed += 1
             log.warning("相册第 %s 个下载失败：%s", idx, exc)
-    text = f"✅ 相册下载完成：{ok}/{len(messages)} 个，共 {human_size(total_bytes)}"
+    if group_label:
+        text = f"✅ 相册下载完成：{ok}/{len(messages)} 个，共 {human_size(total_bytes)}\n🏷 标签 `{group_label}`"
+    else:
+        text = f"✅ 相册下载完成：{ok}/{len(messages)} 个，共 {human_size(total_bytes)}"
     if failed:
         text += f"\n⚠️ {failed} 个失败"
     await safe_edit(status, text)
@@ -468,10 +539,11 @@ def guess_name(url: str, resp: httpx.Response) -> str:
     return name or "download.bin"
 
 
-async def download_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def download_url(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str = "") -> None:
     msg = update.effective_message
     user = update.effective_user
     url = URL_RE.search(msg.text).group(0).rstrip(").,，。、")
+    tag = clean_label(label) or clean_label(replied_text(msg))
 
     if TME_RE.match(url):
         await msg.reply_text(
@@ -504,6 +576,8 @@ async def download_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 filename = sanitize(guess_name(url, resp))
                 if not Path(filename).suffix:
                     filename += CT_EXT.get(content_type, "")
+                # 链接旁边的文字就是标签，例如「合同 https://...」
+                filename = label_to_name(tag, filename)
                 total = int(resp.headers.get("Content-Length") or 0)
                 if limit and total and total > limit:
                     raise ValueError(f"文件 {human_size(total)} 超过上限 {MAX_URL_SIZE_MB} MB")
@@ -541,6 +615,7 @@ async def download_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     entry = {
         "id": new_file_id(),
         "name": dest.name,
+        "label": tag,
         "size": done,
         "user_id": user.id,
         "username": user.username or user.full_name,
@@ -597,6 +672,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1️⃣ 发文件给我 → 自动下载并入库\n"
         "2️⃣ 发多个文件（相册）→ 合并处理\n"
         "3️⃣ 发直链 → 机器人帮你下载到服务器\n\n"
+        "*文件命名（方便索引）*\n"
+        "我用你给的 *文字标签* 当文件名，取用顺序：\n"
+        "① 文件自带的文字说明（caption）\n"
+        "② 回复某句话再发文件 → 用那句话\n"
+        "③ 发链接时写在链接旁边的文字\n"
+        "相册共用标签并自动编号：`标签_1.jpg`、`标签_2.jpg`\n"
+        "三种都没有时才用原始文件名。\n\n"
         "*命令列表*\n"
         "/list \\[数量\\] — 列出最近的文件（默认 20 条）\n"
         "/search 关键字 — 按文件名/上传者搜索\n"
@@ -674,7 +756,13 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("用法：`/search 关键字`", parse_mode=ParseMode.MARKDOWN)
         return
     kw = " ".join(context.args).lower()
-    items = [f for f in FILES if kw in f["name"].lower() or kw in str(f.get("username", "")).lower()]
+    items = [
+        f
+        for f in FILES
+        if kw in f["name"].lower()
+        or kw in str(f.get("label", "")).lower()
+        or kw in str(f.get("username", "")).lower()
+    ]
     await _send_list(update.message, items[::-1][:30], f"搜索「{kw}」")
 
 
@@ -905,10 +993,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(user.id, update.effective_chat.id):
         await request_access(update, context, user)
         return
-    if URL_RE.search(msg.text or ""):
-        await download_url(update, context)
+    text = msg.text or ""
+    match = URL_RE.search(text)
+    if match:
+        # 链接前后的文字当标签，例如「合同 https://...」→ 文件名「合同.pdf」
+        tag = (text[: match.start()] + " " + text[match.end() :]).strip()
+        await download_url(update, context, label=tag)
     else:
-        await msg.reply_text("把文件或 http(s) 直链发给我就行，/help 看说明。")
+        await msg.reply_text(
+            "把文件或 http(s) 直链发给我就行，/help 看说明。\n\n"
+            "提示：给文件配一句文字说明（caption），或者回复一句话再发文件，\n"
+            "我就会用那句话给文件命名，之后可以用 /search 找。"
+        )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
