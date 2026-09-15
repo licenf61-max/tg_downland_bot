@@ -1,6 +1,7 @@
 .env
 downloads/
 data/
+.venv/
 __pycache__/
 *.pyc
 *.part
