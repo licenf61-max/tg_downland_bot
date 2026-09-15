@@ -681,7 +681,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "三种都没有时才用原始文件名。\n\n"
         "*命令列表*\n"
         "/list \\[数量\\] — 列出最近的文件（默认 20 条）\n"
-        "/search 关键字 — 按文件名/上传者搜索\n"
+        "/search 关键字 — 按文件名/标签/上传者搜索\n"
         "/get 文件ID — 重新获取文件\n"
         "/del 文件ID — 删除文件（会二次确认）\n"
         "/mine — 我上传的文件\n"
